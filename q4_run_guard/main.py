@@ -1,6 +1,7 @@
 from fastapi import FastAPI
 from pydantic import BaseModel
 from typing import Any
+import re
 
 app = FastAPI()
 
@@ -17,32 +18,36 @@ class Request(BaseModel):
     steps: list[Step]
 
 
-def normalize_string(s: str) -> str:
-    return " ".join(s.split())
+# -----------------------------
+# Canonicalization
+# -----------------------------
+
+_whitespace = re.compile(r"\s+")
 
 
-def canonicalize(obj):
+def canonicalize(value):
     """
-    Normalize arguments:
-      - remove request_id
-      - sort keys
-      - normalize whitespace in strings
+    Canonicalize arguments by:
+      - removing request_id keys
+      - sorting dictionary keys
+      - recursively processing nested dict/list
+      - collapsing whitespace inside strings
     """
-    if isinstance(obj, dict):
-        result = {}
-        for k in sorted(obj.keys()):
-            if k == "request_id":
-                continue
-            result[k] = canonicalize(obj[k])
-        return result
 
-    if isinstance(obj, list):
-        return [canonicalize(x) for x in obj]
+    if isinstance(value, dict):
+        return {
+            k: canonicalize(value[k])
+            for k in sorted(value)
+            if k != "request_id"
+        }
 
-    if isinstance(obj, str):
-        return normalize_string(obj)
+    if isinstance(value, list):
+        return [canonicalize(v) for v in value]
 
-    return obj
+    if isinstance(value, str):
+        return _whitespace.sub(" ", value).strip()
+
+    return value
 
 
 def same_call(a: Step, b: Step):
@@ -52,68 +57,98 @@ def same_call(a: Step, b: Step):
     )
 
 
-@app.post("/")
-def guard(req: Request):
+# -----------------------------
+# Loop detectors
+# -----------------------------
 
-    total = sum(s.tokens_used for s in req.steps)
+def repeated_identical_calls(steps):
+    """
+    Detect 3+ identical consecutive calls at end.
+    """
+
+    if len(steps) < 3:
+        return False
+
+    count = 1
+
+    for i in range(len(steps) - 2, -1, -1):
+        if same_call(steps[i], steps[i + 1]):
+            count += 1
+        else:
+            break
+
+    return count >= 3
+
+
+def repeated_two_cycle(steps):
+    """
+    Detect trailing
+
+    A B A B A B
+
+    or longer.
+
+    Must have at least 6 trailing steps.
+    """
+
+    n = len(steps)
+
+    if n < 6:
+        return False
+
+    A = steps[-2]
+    B = steps[-1]
+
+    length = 2
+
+    i = n - 3
+
+    expect = A
+
+    while i >= 0:
+
+        if same_call(steps[i], expect):
+
+            length += 1
+
+            expect = B if expect is A else A
+
+            i -= 1
+
+        else:
+            break
+
+    return length >= 6
+
+
+# -----------------------------
+# Endpoint
+# -----------------------------
+
+@app.post("/")
+def run_guard(req: Request):
+
+    total = sum(step.tokens_used for step in req.steps)
 
     if total >= req.budget_tokens:
         return {
             "decision": "halt",
-            "reason": f"Cumulative tokens_used ({total}) has reached the budget ({req.budget_tokens})."
+            "reason": f"Cumulative tokens_used ({total}) has reached the budget ({req.budget_tokens}).",
         }
 
-    steps = req.steps
+    if repeated_identical_calls(req.steps):
+        return {
+            "decision": "halt",
+            "reason": "Detected repeated identical tool calls.",
+        }
 
-    #
-    # Rule 1:
-    # same tool + same canonical args
-    # repeated >=3 consecutively
-    #
-    if len(steps) >= 3:
-
-        count = 1
-
-        for i in range(len(steps)-2, -1, -1):
-            if same_call(steps[i], steps[i+1]):
-                count += 1
-            else:
-                break
-
-        if count >= 3:
-            return {
-                "decision": "halt",
-                "reason": "Detected repeated identical tool calls."
-            }
-
-    #
-    # Rule 2:
-    # trailing A B A B A B
-    #
-    if len(steps) >= 6:
-
-        tail = steps[-6:]
-
-        A = tail[0]
-        B = tail[1]
-
-        ok = True
-
-        for i in [2,4]:
-            if not same_call(A, tail[i]):
-                ok = False
-
-        for i in [3,5]:
-            if not same_call(B, tail[i]):
-                ok = False
-
-        if ok:
-            return {
-                "decision": "halt",
-                "reason": "Detected repeating two-step cycle."
-            }
+    if repeated_two_cycle(req.steps):
+        return {
+            "decision": "halt",
+            "reason": "Detected repeating two-step cycle.",
+        }
 
     return {
         "decision": "continue",
-        "reason": "Budget available and no loop detected."
+        "reason": "Budget available and no loop detected.",
     }
